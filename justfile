@@ -22,3 +22,9 @@ mosquitto:
 
 mqtt-monitor:
     mosquitto_sub -h localhost -p 1883 -t '#' -v
+
+test-backend:
+    cargo test --package backend --test integration
+
+stress-test-backend:
+    cargo nextest run -p backend --test integration --stress-count 1000

@@ -1,12 +1,14 @@
-use backend::{build_app, create_mqtt, create_state, spawn_mqtt_loop};
+use backend::{build_app, create_mqtt, create_state, spawn_mqtt_loop, Topics};
 use tracing::info;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let (mqtt_client, eventloop) = create_mqtt("egui-axum-mqtt-backend", "localhost", 1883).await;
-    let state = create_state(mqtt_client);
+    let topics = Topics::default();
+    let (mqtt_client, eventloop) =
+        create_mqtt("egui-axum-mqtt-backend", "localhost", 1883, &topics).await;
+    let state = create_state(mqtt_client, topics);
     let _mqtt_handle = spawn_mqtt_loop(eventloop, state.clone());
 
     let app = build_app(state);

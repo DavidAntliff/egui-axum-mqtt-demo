@@ -11,12 +11,36 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
-// MQTT topics:
-pub const TOPIC_SEND: &str = "egui-axum-mqtt-demo/send"; // "Send" button publishes here
-pub const TOPIC_POLL: &str = "egui-axum-mqtt-demo/poll"; // "Fetch" button reads last msg from here
-pub const TOPIC_LIVE: &str = "egui-axum-mqtt-demo/live"; // Backend pushes live updates from here
-pub const TOPIC_PING_REQ: &str = "egui-axum-mqtt-demo/ping/request";
-pub const TOPIC_PING_RESP: &str = "egui-axum-mqtt-demo/ping/response";
+// Default MQTT topic prefix (production):
+pub const DEFAULT_PREFIX: &str = "egui-axum-mqtt-demo";
+
+/// MQTT topic configuration, to support concurrent testing with unique prefixes
+#[derive(Debug, Clone)]
+pub struct Topics {
+    pub send: String,
+    pub poll: String,
+    pub live: String,
+    pub ping_req: String,
+    pub ping_resp: String,
+}
+
+impl Topics {
+    pub fn new(prefix: &str) -> Self {
+        Self {
+            send: format!("{prefix}/send"),
+            poll: format!("{prefix}/poll"),
+            live: format!("{prefix}/live"),
+            ping_req: format!("{prefix}/ping/request"),
+            ping_resp: format!("{prefix}/ping/response"),
+        }
+    }
+}
+
+impl Default for Topics {
+    fn default() -> Self {
+        Self::new(DEFAULT_PREFIX)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,6 +48,7 @@ pub struct AppState {
     pub last_poll_msg: Arc<RwLock<Option<LastMessage>>>,
     /// Broadcast channel: backend + all WebSocket clients
     pub tx: broadcast::Sender<ServerMsg>,
+    pub topics: Topics,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -33,22 +58,27 @@ pub struct PingPayload {
 }
 
 /// Create MQTT client and event loop, and subscribe to relevant topics
-pub async fn create_mqtt(client_id: &str, host: &str, port: u16) -> (AsyncClient, EventLoop) {
+pub async fn create_mqtt(
+    client_id: &str,
+    host: &str,
+    port: u16,
+    topics: &Topics,
+) -> (AsyncClient, EventLoop) {
     let mut opts = MqttOptions::new(client_id, host, port);
     opts.set_keep_alive(std::time::Duration::from_secs(30));
 
     let (client, eventloop) = AsyncClient::new(opts, 50);
 
     client
-        .subscribe(TOPIC_POLL, QoS::AtLeastOnce)
+        .subscribe(&topics.poll, QoS::AtLeastOnce)
         .await
         .unwrap();
     client
-        .subscribe(TOPIC_LIVE, QoS::AtLeastOnce)
+        .subscribe(&topics.live, QoS::AtLeastOnce)
         .await
         .unwrap();
     client
-        .subscribe(TOPIC_PING_RESP, QoS::AtLeastOnce)
+        .subscribe(&topics.ping_resp, QoS::AtLeastOnce)
         .await
         .unwrap();
 
@@ -56,13 +86,14 @@ pub async fn create_mqtt(client_id: &str, host: &str, port: u16) -> (AsyncClient
 }
 
 /// Build the shared application state
-pub fn create_state(mqtt_client: AsyncClient) -> AppState {
+pub fn create_state(mqtt_client: AsyncClient, topics: Topics) -> AppState {
     let (tx, _rx) = broadcast::channel::<ServerMsg>(100);
 
     AppState {
         mqtt_client,
         last_poll_msg: Arc::new(RwLock::new(None)),
         tx,
+        topics,
     }
 }
 
@@ -76,28 +107,25 @@ pub fn spawn_mqtt_loop(mut eventloop: EventLoop, state: AppState) -> tokio::task
                     let payload = String::from_utf8_lossy(&publish.payload).to_string();
                     info!("MQTT recv: {} -> {}", topic, payload);
 
-                    match topic.as_str() {
-                        TOPIC_POLL => {
-                            let msg = LastMessage {
-                                topic: topic.clone(),
-                                payload: payload.clone(),
-                                timestamp_ms: now_ms(),
-                            };
-                            *state.last_poll_msg.write().unwrap() = Some(msg);
+                    if topic == state.topics.poll {
+                        let msg = LastMessage {
+                            topic: topic.clone(),
+                            payload: payload.clone(),
+                            timestamp_ms: now_ms(),
+                        };
+                        *state.last_poll_msg.write().unwrap() = Some(msg);
+                    } else if topic == state.topics.live {
+                        let _ = state.tx.send(ServerMsg::MqttUpdate { topic, payload });
+                    } else if topic == state.topics.ping_resp {
+                        // Correlation ID in payload
+                        if let Ok(resp) = serde_json::from_str::<PingPayload>(&payload) {
+                            let _ = state.tx.send(ServerMsg::PingResponse {
+                                correlation_id: resp.correlation_id,
+                                device_reply: resp.message,
+                            });
                         }
-                        TOPIC_LIVE => {
-                            let _ = state.tx.send(ServerMsg::MqttUpdate { topic, payload });
-                        }
-                        TOPIC_PING_RESP => {
-                            // Correlation ID in payload
-                            if let Ok(resp) = serde_json::from_str::<PingPayload>(&payload) {
-                                let _ = state.tx.send(ServerMsg::PingResponse {
-                                    correlation_id: resp.correlation_id,
-                                    device_reply: resp.message,
-                                });
-                            }
-                        }
-                        _ => {}
+                    } else {
+                        warn!("Received message on unexpected topic: {}", topic);
                     }
                 }
                 Ok(_) => {} // connack, suback, etc.
@@ -151,7 +179,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             Ok(ClientMsg::Publish { payload }) => {
                                 info!("Publishing to MQTT: {payload}");
                                 let _ = state.mqtt_client
-                                    .publish(TOPIC_SEND, QoS::AtLeastOnce, false, payload.as_bytes())
+                                    .publish(&state.topics.send, QoS::AtLeastOnce, false, payload.as_bytes())
                                     .await;
                             }
                             Ok(ClientMsg::PingDevice { correlation_id }) => {
@@ -160,7 +188,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     message: "ping".into(),
                                 }).unwrap();
                                 let _ = state.mqtt_client
-                                    .publish(TOPIC_PING_REQ, QoS::AtLeastOnce, false, ping.as_bytes())
+                                    .publish(&state.topics.ping_req, QoS::AtLeastOnce, false, ping.as_bytes())
                                     .await;
                             }
                             Err(e) => warn!("Bad client message: {e}"),
