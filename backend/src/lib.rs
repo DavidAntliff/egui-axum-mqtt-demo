@@ -183,6 +183,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     .await;
                             }
                             Ok(ClientMsg::PingDevice { correlation_id }) => {
+                                info!("Pinging Device: {correlation_id}");
                                 let ping = serde_json::to_string(&PingPayload {
                                     correlation_id,
                                     message: "ping".into(),
