@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "common",
+    "backend",
+    "frontend",
+]
+resolver = "3"
+
