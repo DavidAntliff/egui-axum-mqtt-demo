@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // Default MQTT topic prefix (production):
 pub const DEFAULT_PREFIX: &str = "egui-axum-mqtt-demo";
@@ -42,7 +42,7 @@ impl Default for Topics {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub mqtt_client: AsyncClient,
     pub last_poll_msg: Arc<RwLock<Option<LastMessage>>>,
@@ -105,27 +105,43 @@ pub fn spawn_mqtt_loop(mut eventloop: EventLoop, state: AppState) -> tokio::task
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     let topic = publish.topic.clone();
                     let payload = String::from_utf8_lossy(&publish.payload).to_string();
-                    info!("MQTT recv: {} -> {}", topic, payload);
+                    info!("MQTT recv: {topic} -> {payload}");
 
-                    if topic == state.topics.poll {
-                        let msg = LastMessage {
-                            topic: topic.clone(),
-                            payload: payload.clone(),
-                            timestamp_ms: now_ms(),
-                        };
-                        *state.last_poll_msg.write().unwrap() = Some(msg);
-                    } else if topic == state.topics.live {
-                        let _ = state.tx.send(ServerMsg::MqttUpdate { topic, payload });
-                    } else if topic == state.topics.ping_resp {
-                        // Correlation ID in payload
-                        if let Ok(resp) = serde_json::from_str::<PingPayload>(&payload) {
-                            let _ = state.tx.send(ServerMsg::PingResponse {
-                                correlation_id: resp.correlation_id,
-                                device_reply: resp.message,
-                            });
+                    match topic.as_str() {
+                        t if t == state.topics.poll => {
+                            let msg = LastMessage {
+                                topic: topic.clone(),
+                                payload: payload.clone(),
+                                timestamp_ms: now_ms(),
+                            };
+                            *state.last_poll_msg.write().unwrap() = Some(msg);
                         }
-                    } else {
-                        warn!("Received message on unexpected topic: {}", topic);
+                        t if t == state.topics.live => {
+                            match state.tx.send(ServerMsg::MqttUpdate { topic, payload }) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    error!("MQTT send error: {e}")
+                                }
+                            }
+                        }
+                        t if t == state.topics.ping_resp => {
+                            if let Ok(resp) = serde_json::from_str::<PingPayload>(&payload) {
+                                match state.tx.send(ServerMsg::PingResponse {
+                                    correlation_id: resp.correlation_id,
+                                    device_reply: resp.message,
+                                }) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("MQTT send error: {e}")
+                                    }
+                                }
+                            } else {
+                                warn!("Invalid JSON: {payload:?}");
+                            }
+                        }
+                        _ => {
+                            warn!("Received message on unexpected topic: {topic}");
+                        }
                     }
                 }
                 Ok(_) => {} // connack, suback, etc.
